@@ -7,7 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QEvent
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,40 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QScrollArea,
 )
+
+class ClickableSlider(QSlider):
+    """トラックをクリックでジャンプ、つまみをドラッグで移動できるスライダー（スタイルに依存しない）"""
+
+    def _value_to_x(self, value):
+        """値に対応するつまみ中心の x 位置（ウィジェット座標）"""
+        w = self.width()
+        margin = 12
+        span = max(1, w - 2 * margin)
+        r = (value - self.minimum()) / max(1, self.maximum() - self.minimum())
+        return margin + r * span
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if self.orientation() != Qt.Horizontal:
+            super().mousePressEvent(event)
+            return
+        pos_x = int(event.position().x())
+        handle_center = self._value_to_x(self.value())
+        handle_half = 10
+        # つまみの上ならドラッグに任せる
+        if abs(pos_x - handle_center) <= handle_half:
+            super().mousePressEvent(event)
+            return
+        # トラックをクリック → その位置へジャンプ
+        w = self.width()
+        margin = 12
+        span = max(1, w - 2 * margin)
+        val = self.minimum() + (self.maximum() - self.minimum()) * (pos_x - margin) / span
+        self.setValue(int(max(self.minimum(), min(self.maximum(), val))))
+        event.accept()
+
 
 # コマ送り: 左＝前へ、右＝次へ。表示はシンプルに ±フレーム数
 FRAME_STEP_OPTIONS = [
@@ -182,10 +216,12 @@ class VideoToolWindow(QMainWindow):
         # シークスライダー
         seek_layout = QHBoxLayout()
         self.label_time = QLabel("0:00 / 0:00")
-        self.slider_seek = QSlider(Qt.Horizontal)
+        self.slider_seek = ClickableSlider(Qt.Horizontal)
         self.slider_seek.setMinimum(0)
         self.slider_seek.setMaximum(0)
         self.slider_seek.sliderMoved.connect(self.on_seek)
+        self.slider_seek.valueChanged.connect(self.on_seek)
+        self.slider_seek.installEventFilter(self)
         seek_layout.addWidget(self.label_time)
         seek_layout.addWidget(self.slider_seek, 1)
         scroll_layout.addLayout(seek_layout)
@@ -219,7 +255,7 @@ class VideoToolWindow(QMainWindow):
         # 開始・終了をドラッグで指定するスライダー
         trim_slider_layout = QHBoxLayout()
         trim_slider_layout.addWidget(QLabel("開始", minimumWidth=32))
-        self.slider_trim_in = QSlider(Qt.Horizontal)
+        self.slider_trim_in = ClickableSlider(Qt.Horizontal)
         self.slider_trim_in.setMinimum(0)
         self.slider_trim_in.setMaximum(0)
         self.slider_trim_in.valueChanged.connect(self._on_trim_in_slider)
@@ -227,7 +263,7 @@ class VideoToolWindow(QMainWindow):
         trim_layout.addLayout(trim_slider_layout)
         trim_slider_layout2 = QHBoxLayout()
         trim_slider_layout2.addWidget(QLabel("終了", minimumWidth=32))
-        self.slider_trim_out = QSlider(Qt.Horizontal)
+        self.slider_trim_out = ClickableSlider(Qt.Horizontal)
         self.slider_trim_out.setMinimum(0)
         self.slider_trim_out.setMaximum(0)
         self.slider_trim_out.valueChanged.connect(self._on_trim_out_slider)
@@ -411,6 +447,12 @@ class VideoToolWindow(QMainWindow):
         self.playing = False
         self._stop_playback_thread()
         self._update_trim_ui_state()
+
+    def eventFilter(self, obj, event):
+        """再生中にシークスライダーを触ったら一時停止して操作できるようにする"""
+        if obj == self.slider_seek and event.type() == QEvent.MouseButtonPress and self.playing:
+            self.pause_play()
+        return super().eventFilter(obj, event)
 
     def stop_play(self):
         self.pause_play()
