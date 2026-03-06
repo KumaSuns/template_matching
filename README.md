@@ -16,7 +16,7 @@ python run.py
 **個別に起動**
 
 ```bash
-cd template_matching
+cd analyzer
 pip install -r requirements.txt
 python gui.py
 ```
@@ -25,7 +25,7 @@ python gui.py
 
 | フォルダ | 説明 |
 |---------|------|
-| [template_matching/](template_matching/) | 画像中でテンプレート画像を検出する（OpenCV） |
+| [analyzer/](analyzer/) | 動画の再生・コマ送り（保存・トリミングなし） |
 | [video_tool/](video_tool/) | 動画の取り込み・再生・コマ送り・キャプチャ・トリミング |
 
 ※ 新しいシステムを追加したら、ルートの `run.py` の `SYSTEMS` にフォルダ名と表示名を追加してください。

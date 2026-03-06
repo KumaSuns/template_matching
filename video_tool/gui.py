@@ -7,7 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QEvent
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QEvent, QTimer
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,14 +17,16 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QSizePolicy,
     QFrame,
+    QLayout,
+    QSplitter,
     QPushButton,
     QLabel,
     QSlider,
     QFileDialog,
     QGroupBox,
     QSpinBox,
+    QComboBox,
     QMessageBox,
-    QScrollArea,
 )
 
 class ClickableSlider(QSlider):
@@ -96,11 +98,12 @@ class PlaybackThread(QThread):
     frame_ready = Signal(int, object)  # frame_index, frame (numpy copy)
     finished_playback = Signal()
 
-    def __init__(self, path: str, fps: float, total_frames: int):
+    def __init__(self, path: str, fps: float, total_frames: int, speed: float = 1.0):
         super().__init__()
         self.path = path
         self.fps = max(1.0, fps)
         self.total_frames = total_frames
+        self.speed = max(0.25, min(1.0, speed))
         self.start_frame = 0
         self._stop = False
 
@@ -116,7 +119,7 @@ class PlaybackThread(QThread):
         if not cap.isOpened():
             return
         try:
-            frame_interval = 1.0 / self.fps
+            frame_interval = 1.0 / (self.fps * self.speed)
             cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
             frame_index = self.start_frame
             while not self._stop and frame_index < self.total_frames:
@@ -149,156 +152,242 @@ class VideoToolWindow(QMainWindow):
         self.playback_thread: PlaybackThread | None = None
         self.in_point = 0
         self.out_point = 0
+        self.crop_left = 0
+        self.crop_top = 0
+        self.crop_width = 0
+        self.crop_height = 0
+        self._frame_width = 0
+        self._frame_height = 0
+        self._current_frame_np = None
+        self._dragging_crop = False
+        self._drag_start = None
+        self._drag_current = None
+        self._disp_pix_w = 0
+        self._disp_pix_h = 0
+        self._disp_off_x = 0
+        self._disp_off_y = 0
+        self._pending_playback_frame = None
+        self._pending_playback_index = -1
+        self._last_paint_time = 0.0
         _settings = QSettings("template_matching", "video_tool")
         self._last_video_dir = _settings.value("lastVideoDir", "", type=str)
+        _templates = Path(__file__).resolve().parent.parent / "templates"
+        self._templates_dir = str(_templates)
+        self._template_categories = ("bonus", "fever", "go", "result", "skill", "timeup")
         self.setWindowTitle("動画ツール")
-        self.setMinimumSize(1000, 720)
+        self.setMinimumSize(980, 1000)
+        self.resize(1020, 1040)
         self.setup_ui()
+
 
     def setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        main = QVBoxLayout(central)
+        main.setSizeConstraint(QLayout.SetMinimumSize)
+        main.setSpacing(8)
+        main.setContentsMargins(8, 8, 8, 8)
 
-        # ファイル
-        file_group = QGroupBox("ファイル")
-        file_layout = QHBoxLayout(file_group)
+        # 左右2分割
+        splitter = QSplitter(Qt.Horizontal)
+
+        # === 左エリア: 動画を開く → 動画 → スライダー → 再生等 → コマ送り ===
+        left = QWidget()
+        left.setMinimumWidth(560)
+        left_layout = QVBoxLayout(left)
+        left_layout.setSpacing(10)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        open_area = QFrame()
+        open_area.setFrameStyle(QFrame.StyledPanel)
+        open_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        open_area.setFixedHeight(48)
+        open_area_layout = QHBoxLayout(open_area)
+        open_area_layout.setContentsMargins(6, 6, 6, 6)
         self.btn_open = QPushButton("動画を開く")
         self.label_path = QLabel("（未選択）")
         self.label_path.setStyleSheet("color: #666;")
-        file_layout.addWidget(self.btn_open)
-        file_layout.addWidget(self.label_path)
-        file_layout.addStretch()
-        layout.addWidget(file_group)
+        open_area_layout.addWidget(self.btn_open)
+        open_area_layout.addWidget(self.label_path, 1)
+        left_layout.addWidget(open_area)
         self.btn_open.clicked.connect(self.open_video)
 
-        # 映像表示（高さを固定し、下のUIが必ず見えるようにする）
-        video_frame = QFrame()
-        video_frame.setFrameStyle(QFrame.StyledPanel)
-        video_frame.setFixedHeight(400)
-        video_frame.setMinimumWidth(640)
-        video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        video_layout = QVBoxLayout(video_frame)
-        video_layout.setContentsMargins(0, 0, 0, 0)
+        video_area = QFrame()
+        video_area.setFrameStyle(QFrame.StyledPanel)
+        video_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        video_area.setMinimumSize(560, 720)
+        video_area.setFixedHeight(720)
+        video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        vl = QVBoxLayout(video_area)
+        vl.setContentsMargins(0, 0, 0, 0)
         self.label_video = QLabel()
         self.label_video.setAlignment(Qt.AlignCenter)
-        self.label_video.setMinimumSize(320, 200)
-        self.label_video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.label_video.setStyleSheet("background: #1a1a1a; color: #666; font-size: 14px;")
+        self.label_video.setStyleSheet("color: #999;")
         self.label_video.setText("動画を開いてください")
-        video_layout.addWidget(self.label_video)
-        layout.addWidget(video_frame, 0, Qt.AlignTop)
+        self.label_video.setMouseTracking(True)
+        self.label_video.installEventFilter(self)
+        vl.addWidget(self.label_video)
+        left_layout.addWidget(video_area)
 
-        # 以下はスクロール可能（動画と被らない）
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 再生コントロール
-        ctrl_group = QGroupBox("再生")
-        ctrl_layout = QHBoxLayout(ctrl_group)
-        self.btn_play = QPushButton("再生")
-        self.btn_pause = QPushButton("一時停止")
-        self.btn_stop = QPushButton("停止")
-        self.btn_play.clicked.connect(self.start_play)
-        self.btn_pause.clicked.connect(self.pause_play)
-        self.btn_stop.clicked.connect(self.stop_play)
-        ctrl_layout.addWidget(self.btn_play)
-        ctrl_layout.addWidget(self.btn_pause)
-        ctrl_layout.addWidget(self.btn_stop)
-        ctrl_layout.addStretch()
-        scroll_layout.addWidget(ctrl_group)
-
-        # シークスライダー
-        seek_layout = QHBoxLayout()
+        seek_area = QFrame()
+        seek_area.setFrameStyle(QFrame.StyledPanel)
+        seek_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        seek_area_layout = QHBoxLayout(seek_area)
+        seek_area_layout.setContentsMargins(6, 6, 6, 6)
         self.label_time = QLabel("0:00 / 0:00")
+        self.label_time.setMinimumWidth(90)
+        seek_area_layout.addWidget(self.label_time)
         self.slider_seek = ClickableSlider(Qt.Horizontal)
         self.slider_seek.setMinimum(0)
         self.slider_seek.setMaximum(0)
         self.slider_seek.sliderMoved.connect(self.on_seek)
         self.slider_seek.valueChanged.connect(self.on_seek)
         self.slider_seek.installEventFilter(self)
-        seek_layout.addWidget(self.label_time)
-        seek_layout.addWidget(self.slider_seek, 1)
-        scroll_layout.addLayout(seek_layout)
+        seek_area_layout.addWidget(self.slider_seek, 1)
+        left_layout.addWidget(seek_area)
 
-        # コマ送り（左: 前へ / 右: 次へ）
-        step_group = QGroupBox("コマ送り")
-        step_layout = QHBoxLayout(step_group)
+        ctrl_area = QFrame()
+        ctrl_area.setFrameStyle(QFrame.StyledPanel)
+        ctrl_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        ctrl_area_layout = QHBoxLayout(ctrl_area)
+        ctrl_area_layout.setContentsMargins(6, 6, 6, 6)
+        ctrl_area_layout.addStretch()
+        self.btn_play = QPushButton("再生")
+        self.btn_pause = QPushButton("一時停止")
+        self.btn_stop = QPushButton("停止")
+        self.combo_speed = QComboBox()
+        for label, value in [("1x", 1.0), ("1/2x", 0.5), ("1/4x", 0.25)]:
+            self.combo_speed.addItem(label, value)
+        self.combo_speed.setCurrentIndex(0)
+        self.btn_play.clicked.connect(self.start_play)
+        self.btn_pause.clicked.connect(self.pause_play)
+        self.btn_stop.clicked.connect(self.stop_play)
+        ctrl_area_layout.addWidget(self.btn_play)
+        ctrl_area_layout.addWidget(self.btn_pause)
+        ctrl_area_layout.addWidget(self.btn_stop)
+        ctrl_area_layout.addWidget(QLabel("速度:"))
+        ctrl_area_layout.addWidget(self.combo_speed)
+        self.combo_speed.currentIndexChanged.connect(self._on_speed_changed)
+        ctrl_area_layout.addStretch()
+        left_layout.addWidget(ctrl_area)
+
+        step_area = QFrame()
+        step_area.setFrameStyle(QFrame.StyledPanel)
+        step_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        step_area_layout = QHBoxLayout(step_area)
+        step_area_layout.setContentsMargins(6, 6, 6, 6)
+        step_area_layout.addStretch()
         self.step_buttons = []
         for label, delta in FRAME_STEP_OPTIONS:
             btn = QPushButton(label)
-            btn.setFixedWidth(48)
-            btn.setStyleSheet("font-weight: bold; font-size: 13px;")
+            btn.setFixedWidth(52)
             btn.clicked.connect(lambda checked=False, d=delta: self.do_frame_step(d))
-            step_layout.addWidget(btn)
+            step_area_layout.addWidget(btn)
             self.step_buttons.append(btn)
-        step_layout.addStretch()
-        scroll_layout.addWidget(step_group)
+        step_area_layout.addStretch()
+        left_layout.addWidget(step_area)
 
-        # キャプチャ
-        cap_group = QGroupBox("キャプチャ")
-        cap_layout = QHBoxLayout(cap_group)
-        self.btn_capture = QPushButton("現在のフレームを画像として保存")
-        self.btn_capture.clicked.connect(self.capture_frame)
-        cap_layout.addWidget(self.btn_capture)
-        scroll_layout.addWidget(cap_group)
+        left_layout.addStretch()
+        splitter.addWidget(left)
 
-        # トリミング（一時停止時のみ有効。ドラッグ＋数値入力で範囲指定）
-        trim_group = QGroupBox("トリミング（一時停止時のみ）")
-        trim_layout = QVBoxLayout(trim_group)
-        trim_layout.addWidget(QLabel("範囲をドラッグまたは数値で指定:"))
-        # 開始・終了をドラッグで指定するスライダー
-        trim_slider_layout = QHBoxLayout()
-        trim_slider_layout.addWidget(QLabel("開始", minimumWidth=32))
-        self.slider_trim_in = ClickableSlider(Qt.Horizontal)
-        self.slider_trim_in.setMinimum(0)
-        self.slider_trim_in.setMaximum(0)
-        self.slider_trim_in.valueChanged.connect(self._on_trim_in_slider)
-        trim_slider_layout.addWidget(self.slider_trim_in, 1)
-        trim_layout.addLayout(trim_slider_layout)
-        trim_slider_layout2 = QHBoxLayout()
-        trim_slider_layout2.addWidget(QLabel("終了", minimumWidth=32))
-        self.slider_trim_out = ClickableSlider(Qt.Horizontal)
-        self.slider_trim_out.setMinimum(0)
-        self.slider_trim_out.setMaximum(0)
-        self.slider_trim_out.valueChanged.connect(self._on_trim_out_slider)
-        trim_slider_layout2.addWidget(self.slider_trim_out, 1)
-        trim_layout.addLayout(trim_slider_layout2)
-        # 数値入力（スライダーと併用）
-        trim_input_layout = QHBoxLayout()
-        trim_input_layout.addWidget(QLabel("開始:"))
-        self.spin_in = QSpinBox()
-        self.spin_in.setMinimum(0)
-        self.spin_in.setMaximum(0)
-        self.spin_in.valueChanged.connect(self._on_trim_in_spin)
-        trim_input_layout.addWidget(self.spin_in)
-        trim_input_layout.addWidget(QLabel("終了:"))
-        self.spin_out = QSpinBox()
-        self.spin_out.setMinimum(0)
-        self.spin_out.setMaximum(0)
-        self.spin_out.valueChanged.connect(self._on_trim_out_spin)
-        trim_input_layout.addWidget(self.spin_out)
-        self.btn_set_in = QPushButton("ここを開始に")
-        self.btn_set_out = QPushButton("ここを終了に")
-        self.btn_set_in.clicked.connect(self.set_in_point)
-        self.btn_set_out.clicked.connect(self.set_out_point)
-        trim_input_layout.addWidget(self.btn_set_in)
-        trim_input_layout.addWidget(self.btn_set_out)
-        trim_input_layout.addStretch()
-        trim_layout.addLayout(trim_input_layout)
-        self.btn_export_trim = QPushButton("トリミングして保存")
-        self.btn_export_trim.clicked.connect(self.export_trimmed)
-        trim_layout.addWidget(self.btn_export_trim)
-        scroll_layout.addWidget(trim_group)
+        # === 右エリア: トリミング ===
+        right = QWidget()
+        right.setMinimumWidth(260)
+        right_layout = QVBoxLayout(right)
+        right_layout.setSpacing(10)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_open_area = QFrame()
+        right_open_area.setFrameStyle(QFrame.StyledPanel)
+        right_open_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        right_open_area.setFixedHeight(48)
+        right_open_area_layout = QHBoxLayout(right_open_area)
+        right_open_area_layout.setContentsMargins(6, 6, 6, 6)
+        right_layout.addWidget(right_open_area)
+        right_video_area = QFrame()
+        right_video_area.setFrameStyle(QFrame.StyledPanel)
+        right_video_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        right_video_area.setMinimumSize(260, 720)
+        right_video_area.setFixedHeight(720)
+        right_video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        right_video_layout = QVBoxLayout(right_video_area)
+        right_video_layout.setContentsMargins(0, 0, 0, 0)
+        self.label_crop_preview = QLabel()
+        self.label_crop_preview.setMinimumSize(384, 216)
+        self.label_crop_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.label_crop_preview.setAlignment(Qt.AlignCenter)
+        self.label_crop_preview.setStyleSheet("color: #999;")
+        self.label_crop_preview.setText("（範囲指定で表示）")
+        self.label_crop_preview.setScaledContents(False)
+        right_video_layout.setContentsMargins(12, 12, 12, 12)
+        right_video_layout.addWidget(self.label_crop_preview, 1)
+        right_layout.addWidget(right_video_area)
+        trim_group = QGroupBox("トリミング")
+        trim_group.setStyleSheet("QGroupBox { border: 1px solid #ddd; margin-top: 8px; padding-top: 8px; }")
         self.trim_group = trim_group
+        trim_layout = QVBoxLayout(trim_group)
+        trim_layout.setSpacing(10)
+        tr1 = QHBoxLayout()
+        tr1.setSpacing(6)
+        tr1.addStretch()
+        tr1.addWidget(QLabel("左:"))
+        self.spin_crop_left = QSpinBox()
+        self.spin_crop_left.setMinimum(0)
+        self.spin_crop_left.setMaximum(0)
+        self.spin_crop_left.valueChanged.connect(self._on_crop_spin_changed)
+        tr1.addWidget(self.spin_crop_left)
+        tr1.addWidget(QLabel("上:"))
+        self.spin_crop_top = QSpinBox()
+        self.spin_crop_top.setMinimum(0)
+        self.spin_crop_top.setMaximum(0)
+        self.spin_crop_top.valueChanged.connect(self._on_crop_spin_changed)
+        tr1.addWidget(self.spin_crop_top)
+        tr1.addWidget(QLabel("幅:"))
+        self.spin_crop_width = QSpinBox()
+        self.spin_crop_width.setMinimum(1)
+        self.spin_crop_width.setMaximum(0)
+        self.spin_crop_width.valueChanged.connect(self._on_crop_spin_changed)
+        tr1.addWidget(self.spin_crop_width)
+        tr1.addWidget(QLabel("高さ:"))
+        self.spin_crop_height = QSpinBox()
+        self.spin_crop_height.setMinimum(1)
+        self.spin_crop_height.setMaximum(0)
+        self.spin_crop_height.valueChanged.connect(self._on_crop_spin_changed)
+        tr1.addWidget(self.spin_crop_height)
+        tr1.addStretch()
+        trim_layout.addLayout(tr1)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.btn_export_trim_image = QPushButton("トリミング範囲を画像で保存")
+        self.btn_export_trim_image.clicked.connect(self.export_trim_as_image)
+        btn_row.addWidget(self.btn_export_trim_image)
+        btn_row.addStretch()
+        trim_layout.addLayout(btn_row)
+        right_layout.addWidget(trim_group)
+        splitter.addWidget(right)
 
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll, 1)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([500, 500])
+
+        # === 下: 現在のフレームを保存 ===
+        bottom_bar = QFrame()
+        bottom_bar.setFrameStyle(QFrame.StyledPanel)
+        bottom_bar.setStyleSheet("QFrame { border: 1px solid #ddd; }")
+        bottom_layout = QHBoxLayout(bottom_bar)
+        bottom_layout.setContentsMargins(8, 8, 8, 8)
+        self.btn_capture = QPushButton("現在のフレームを保存")
+        self.btn_capture.clicked.connect(self.capture_frame)
+        bottom_layout.addWidget(self.btn_capture)
+        bottom_layout.addStretch()
+
+        # 縦スプリッター: 上(1+2) 9 : 下(5) 1
+        vert_splitter = QSplitter(Qt.Vertical)
+        vert_splitter.addWidget(splitter)
+        vert_splitter.addWidget(bottom_bar)
+        vert_splitter.setStretchFactor(0, 9)
+        vert_splitter.setStretchFactor(1, 1)
+        vert_splitter.setSizes([900, 100])
+        main.addWidget(vert_splitter)
 
         self.update_ui_state(False)
 
@@ -306,6 +395,7 @@ class VideoToolWindow(QMainWindow):
         self.btn_play.setEnabled(has_video)
         self.btn_pause.setEnabled(has_video)
         self.btn_stop.setEnabled(has_video)
+        self.combo_speed.setEnabled(has_video)
         self.slider_seek.setEnabled(has_video)
         for btn in self.step_buttons:
             btn.setEnabled(has_video)
@@ -316,10 +406,7 @@ class VideoToolWindow(QMainWindow):
         """トリミングは動画読み込み済みかつ一時停止時のみ有効"""
         can_trim = self.cap is not None and not self.playing
         self.trim_group.setEnabled(can_trim)
-        if can_trim:
-            self.trim_group.setTitle("トリミング（一時停止中: 範囲をドラッグまたは数値で指定）")
-        else:
-            self.trim_group.setTitle("トリミング（一時停止時のみ利用できます）")
+        self.trim_group.setTitle("トリミング（一時停止時のみ）" if not can_trim else "トリミング")
 
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -341,16 +428,24 @@ class VideoToolWindow(QMainWindow):
         self.current_frame_index = 0
         self.in_point = 0
         self.out_point = max(0, self.total_frames - 1)
-        self.label_path.setText(Path(path).name)
+        self._frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.crop_left = 0
+        self.crop_top = 0
+        self.crop_width = max(1, self._frame_width)
+        self.crop_height = max(1, self._frame_height)
+        p = Path(path)
+        self.label_path.setText(p.name)
+        self.label_path.setToolTip(str(p.resolve()))
         self.slider_seek.setMaximum(max(0, self.total_frames - 1))
-        self.slider_trim_in.setMaximum(max(0, self.total_frames - 1))
-        self.slider_trim_out.setMaximum(max(0, self.total_frames - 1))
-        self.spin_in.setMaximum(self.total_frames - 1)
-        self.spin_out.setMaximum(self.total_frames - 1)
-        self.spin_in.setValue(0)
-        self.spin_out.setValue(self.out_point)
-        self.slider_trim_in.setValue(0)
-        self.slider_trim_out.setValue(self.out_point)
+        self.spin_crop_left.setMaximum(max(0, self._frame_width - 1))
+        self.spin_crop_top.setMaximum(max(0, self._frame_height - 1))
+        self.spin_crop_width.setMaximum(self._frame_width)
+        self.spin_crop_height.setMaximum(self._frame_height)
+        self.spin_crop_left.setValue(0)
+        self.spin_crop_top.setValue(0)
+        self.spin_crop_width.setValue(self.crop_width)
+        self.spin_crop_height.setValue(self.crop_height)
         self.update_ui_state(True)
         self._show_frame_at(self.current_frame_index)
         self._update_time_label()
@@ -362,9 +457,15 @@ class VideoToolWindow(QMainWindow):
             self.cap.release()
             self.cap = None
         self.video_path = None
+        self._current_frame_np = None
+        self._frame_width = 0
+        self._frame_height = 0
         self.update_ui_state(False)
         self.label_video.setText("動画を開いてください")
-        self.label_video.setStyleSheet("background: #1a1a1a; color: #666; font-size: 14px;")
+        self.label_video.setStyleSheet("color: #666; font-size: 14px;")
+        self.label_crop_preview.clear()
+        self.label_crop_preview.setText("（範囲指定で表示）")
+        self.label_crop_preview.setStyleSheet("color: #666;")
 
     def _frame_to_time(self, frame_index: int) -> str:
         if self.fps <= 0:
@@ -392,6 +493,16 @@ class VideoToolWindow(QMainWindow):
             return 0, 0
         return w, h
 
+    def _label_to_video_coords(self, lx: float, ly: float):
+        """ラベル上の座標を動画フレーム座標に変換"""
+        if self._disp_pix_w <= 0 or self._frame_width <= 0:
+            return 0, 0
+        px = lx - self._disp_off_x
+        py = ly - self._disp_off_y
+        vx = int(px * self._frame_width / self._disp_pix_w)
+        vy = int(py * self._frame_height / self._disp_pix_h)
+        return max(0, min(self._frame_width, vx)), max(0, min(self._frame_height, vy))
+
     def _show_frame_at(self, frame_index: int):
         if self.cap is None or self.total_frames == 0:
             return
@@ -400,14 +511,82 @@ class VideoToolWindow(QMainWindow):
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ret, frame = self.cap.read()
         if ret and frame is not None:
-            sw, sh = self._display_size()
-            pix = cv2_to_qpixmap(frame, sw, sh, fast=False)
-            self.label_video.setPixmap(pix)
-            self.label_video.setStyleSheet("")
+            self._current_frame_np = frame.copy()
+            self._paint_frame_with_crop()
         self._update_time_label()
+        self._update_crop_preview()
 
     def on_seek(self, value: int):
         self._show_frame_at(value)
+
+    def _paint_frame_with_crop(self, fast: bool = False):
+        """現在フレームに crop 矩形（またはドラッグ中なら仮矩形）を描画して表示"""
+        if self._current_frame_np is None:
+            return
+        img = self._current_frame_np.copy()
+        if self._dragging_crop and self._drag_start is not None and self._drag_current is not None:
+            x1, y1 = self._drag_start
+            x2, y2 = self._drag_current
+            left, right = min(x1, x2), max(x1, x2)
+            top, bottom = min(y1, y2), max(y1, y2)
+            cv2.rectangle(img, (left, top), (right, bottom), (0, 255, 0), 2)
+        else:
+            l, t = self.crop_left, self.crop_top
+            r, b = l + self.crop_width, t + self.crop_height
+            cv2.rectangle(img, (l, t), (r, b), (0, 255, 0), 2)
+        sw, sh = self._display_size()
+        pix = cv2_to_qpixmap(img, sw, sh, fast=fast)
+        self._disp_pix_w = pix.width()
+        self._disp_pix_h = pix.height()
+        self._disp_off_x = (self.label_video.width() - pix.width()) / 2
+        self._disp_off_y = (self.label_video.height() - pix.height()) / 2
+        self.label_video.setPixmap(pix)
+        self.label_video.setStyleSheet("")
+
+    def _update_crop_preview(self):
+        """トリミング範囲を切り出してプレビューに表示"""
+        if self._current_frame_np is None or self.crop_width <= 0 or self.crop_height <= 0:
+            return
+        h, w = self._current_frame_np.shape[:2]
+        l = max(0, min(self.crop_left, w - 1))
+        t = max(0, min(self.crop_top, h - 1))
+        r = min(w, l + self.crop_width)
+        b = min(h, t + self.crop_height)
+        if r <= l or b <= t:
+            return
+        cropped = self._current_frame_np[t:b, l:r]
+        pw = max(256, self.label_crop_preview.width())
+        ph = max(144, self.label_crop_preview.height())
+        pix = cv2_to_qpixmap(cropped, pw, ph, fast=True)
+        self.label_crop_preview.setPixmap(pix)
+        self.label_crop_preview.setStyleSheet("")
+
+    def _on_crop_spin_changed(self):
+        if self._frame_width <= 0 or self._frame_height <= 0:
+            return
+        self.crop_left = self.spin_crop_left.value()
+        self.crop_top = self.spin_crop_top.value()
+        self.crop_width = max(1, self.spin_crop_width.value())
+        self.crop_height = max(1, self.spin_crop_height.value())
+        self.crop_left = max(0, min(self.crop_left, self._frame_width - 1))
+        self.crop_top = max(0, min(self.crop_top, self._frame_height - 1))
+        self.crop_width = min(self.crop_width, self._frame_width - self.crop_left)
+        self.crop_height = min(self.crop_height, self._frame_height - self.crop_top)
+        self.spin_crop_left.blockSignals(True)
+        self.spin_crop_top.blockSignals(True)
+        self.spin_crop_width.blockSignals(True)
+        self.spin_crop_height.blockSignals(True)
+        self.spin_crop_left.setValue(self.crop_left)
+        self.spin_crop_top.setValue(self.crop_top)
+        self.spin_crop_width.setValue(self.crop_width)
+        self.spin_crop_height.setValue(self.crop_height)
+        self.spin_crop_left.blockSignals(False)
+        self.spin_crop_top.blockSignals(False)
+        self.spin_crop_width.blockSignals(False)
+        self.spin_crop_height.blockSignals(False)
+        if self._current_frame_np is not None:
+            self._paint_frame_with_crop()
+            self._update_crop_preview()
 
     def _stop_playback_thread(self):
         if self.playback_thread and self.playback_thread.isRunning():
@@ -416,27 +595,54 @@ class VideoToolWindow(QMainWindow):
         self.playback_thread = None
 
     def _on_playback_frame(self, frame_index: int, frame: np.ndarray):
+        self._pending_playback_index = frame_index
+        self._pending_playback_frame = frame
+        now = time.perf_counter()
+        if self._last_paint_time == 0.0 or now - self._last_paint_time >= 0.032:
+            self._flush_playback_frame()
+
+    def _flush_playback_frame(self):
+        if self._pending_playback_frame is None:
+            return
+        self._last_paint_time = time.perf_counter()
+        frame_index = self._pending_playback_index
+        frame = self._pending_playback_frame
+        self._pending_playback_frame = None
+        self._pending_playback_index = -1
         self.current_frame_index = frame_index
-        sw, sh = self._display_size()
-        pix = cv2_to_qpixmap(frame, sw, sh, fast=True)
-        self.label_video.setPixmap(pix)
-        self.label_video.setStyleSheet("")
+        self._current_frame_np = frame
+        self._paint_frame_with_crop(fast=True)
         self._update_time_label()
+        if not self.playing:
+            self._update_crop_preview()
 
     def _on_playback_finished(self):
         self.playing = False
         self.playback_thread = None
+        self._flush_playback_frame()
         self._update_time_label()
         self._update_trim_ui_state()
+
+    def _on_speed_changed(self):
+        if self.playing and self.playback_thread and self.playback_thread.isRunning():
+            self._stop_playback_thread()
+            self.start_play()
 
     def start_play(self):
         if self.cap is None or not self.video_path or self.total_frames == 0:
             return
         self._stop_playback_thread()
+        self._pending_playback_frame = None
+        self._last_paint_time = 0.0
         self.playing = True
         self._update_trim_ui_state()
+        try:
+            speed = float(self.combo_speed.currentData())
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = max(0.25, min(1.0, speed))
         self.playback_thread = PlaybackThread(
-            self.video_path, self.fps, self.total_frames
+            self.video_path, self.fps, self.total_frames, speed
         )
         self.playback_thread.set_start_frame(self.current_frame_index)
         self.playback_thread.frame_ready.connect(self._on_playback_frame)
@@ -449,9 +655,51 @@ class VideoToolWindow(QMainWindow):
         self._update_trim_ui_state()
 
     def eventFilter(self, obj, event):
-        """再生中にシークスライダーを触ったら一時停止して操作できるようにする"""
-        if obj == self.slider_seek and event.type() == QEvent.MouseButtonPress and self.playing:
+        if getattr(self, "slider_seek", None) is not None and obj == self.slider_seek and event.type() == QEvent.MouseButtonPress and self.playing:
             self.pause_play()
+        if obj == self.label_video and getattr(self, "cap", None) is not None and not self.playing:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._dragging_crop = True
+                self._drag_start = self._label_to_video_coords(event.position().x(), event.position().y())
+                self._drag_current = self._drag_start
+                return True
+            if event.type() == QEvent.MouseMove:
+                if self._dragging_crop and self._drag_start is not None:
+                    self._drag_current = self._label_to_video_coords(event.position().x(), event.position().y())
+                    self._paint_frame_with_crop()
+                return False
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and self._dragging_crop:
+                self._drag_current = self._label_to_video_coords(event.position().x(), event.position().y())
+                x1, y1 = self._drag_start
+                x2, y2 = self._drag_current
+                left = max(0, min(x1, x2))
+                top = max(0, min(y1, y2))
+                right = min(self._frame_width, max(x1, x2))
+                bottom = min(self._frame_height, max(y1, y2))
+                w = max(1, right - left)
+                h = max(1, bottom - top)
+                self._dragging_crop = False
+                self._drag_start = None
+                self._drag_current = None
+                self.spin_crop_left.blockSignals(True)
+                self.spin_crop_top.blockSignals(True)
+                self.spin_crop_width.blockSignals(True)
+                self.spin_crop_height.blockSignals(True)
+                self.spin_crop_left.setValue(left)
+                self.spin_crop_top.setValue(top)
+                self.spin_crop_width.setValue(w)
+                self.spin_crop_height.setValue(h)
+                self.spin_crop_left.blockSignals(False)
+                self.spin_crop_top.blockSignals(False)
+                self.spin_crop_width.blockSignals(False)
+                self.spin_crop_height.blockSignals(False)
+                self.crop_left = left
+                self.crop_top = top
+                self.crop_width = w
+                self.crop_height = h
+                self._paint_frame_with_crop()
+                self._update_crop_preview()
+                return True
         return super().eventFilter(obj, event)
 
     def stop_play(self):
@@ -465,63 +713,23 @@ class VideoToolWindow(QMainWindow):
         next_index = max(0, min(next_index, self.total_frames - 1))
         self._show_frame_at(next_index)
 
-    def _sync_trim_in_out(self):
-        """開始 > 終了にならないようそろえる（スライダーとスピンは連動済み想定）"""
-        a, b = self.spin_in.value(), self.spin_out.value()
-        if a > b:
-            self.spin_out.blockSignals(True)
-            self.slider_trim_out.blockSignals(True)
-            self.spin_out.setValue(a)
-            self.slider_trim_out.setValue(a)
-            self.spin_out.blockSignals(False)
-            self.slider_trim_out.blockSignals(False)
-        elif b < a:
-            self.spin_in.blockSignals(True)
-            self.slider_trim_in.blockSignals(True)
-            self.spin_in.setValue(b)
-            self.slider_trim_in.setValue(b)
-            self.spin_in.blockSignals(False)
-            self.slider_trim_in.blockSignals(False)
-        self.in_point = self.spin_in.value()
-        self.out_point = self.spin_out.value()
-
-    def _on_trim_in_slider(self, value: int):
-        self.spin_in.blockSignals(True)
-        self.spin_in.setValue(value)
-        self.spin_in.blockSignals(False)
-        self._sync_trim_in_out()
-
-    def _on_trim_out_slider(self, value: int):
-        self.spin_out.blockSignals(True)
-        self.spin_out.setValue(value)
-        self.spin_out.blockSignals(False)
-        self._sync_trim_in_out()
-
-    def _on_trim_in_spin(self, value: int):
-        self.slider_trim_in.blockSignals(True)
-        self.slider_trim_in.setValue(value)
-        self.slider_trim_in.blockSignals(False)
-        self._sync_trim_in_out()
-
-    def _on_trim_out_spin(self, value: int):
-        self.slider_trim_out.blockSignals(True)
-        self.slider_trim_out.setValue(value)
-        self.slider_trim_out.blockSignals(False)
-        self._sync_trim_in_out()
-
-    def set_in_point(self):
-        v = self.current_frame_index
-        self.spin_in.setValue(v)
-        self.slider_trim_in.setValue(v)
-        self.in_point = v
-        self._sync_trim_in_out()
-
-    def set_out_point(self):
-        v = self.current_frame_index
-        self.spin_out.setValue(v)
-        self.slider_trim_out.setValue(v)
-        self.out_point = v
-        self._sync_trim_in_out()
+    def _next_save_path(self, category: str, subdir: str, ext: str) -> str:
+        """category/frames または category/trimmed で既存の XXX_001 を調べ、次の番号のパスを返す"""
+        dir_path = Path(self._templates_dir) / category / subdir
+        dir_path.mkdir(parents=True, exist_ok=True)
+        prefix = f"{category}_"
+        max_n = 0
+        for f in dir_path.iterdir():
+            if not f.is_file():
+                continue
+            if f.name.startswith(prefix) and f.suffix:
+                try:
+                    n = int(f.stem[len(prefix):])
+                    if n > max_n:
+                        max_n = n
+                except ValueError:
+                    pass
+        return str(dir_path / f"{prefix}{max_n + 1:03d}{ext}")
 
     def capture_frame(self):
         if self.cap is None:
@@ -531,49 +739,65 @@ class VideoToolWindow(QMainWindow):
         if not ret or frame is None:
             QMessageBox.warning(self, "キャプチャ", "フレームを取得できませんでした。")
             return
+        default_path = self._next_save_path("bonus", "frames", ".png")
         path, _ = QFileDialog.getSaveFileName(
-            self, "画像を保存", "",
+            self, "画像を保存", default_path,
             "PNG (*.png);;JPEG (*.jpg);;All (*.*)"
         )
         if not path:
             return
-        if cv2.imwrite(path, frame):
-            QMessageBox.information(self, "キャプチャ", f"保存しました: {path}")
-        else:
-            QMessageBox.critical(self, "キャプチャ", "保存に失敗しました。")
+        p = Path(path).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        ext = (p.suffix.lower() or ".png").replace(".jpeg", ".jpg")
+        if ext not in (".png", ".jpg"):
+            ext = ".png"
+        _, buf = cv2.imencode(ext, frame)
+        try:
+            if buf is not None:
+                p.write_bytes(buf.tobytes())
+                QMessageBox.information(self, "キャプチャ", f"保存しました: {p}")
+            else:
+                QMessageBox.critical(self, "キャプチャ", "保存に失敗しました。")
+        except OSError as e:
+            QMessageBox.critical(self, "キャプチャ", f"保存に失敗しました: {e}")
 
-    def export_trimmed(self):
-        if self.cap is None:
+    def export_trim_as_image(self):
+        """トリミング範囲を画像（PNG）で保存"""
+        if self.cap is None or self._current_frame_np is None:
+            QMessageBox.warning(self, "トリミング", "動画を開き、フレームを表示してください。")
             return
-        self._sync_trim_in_out()
-        start_f = self.spin_in.value()
-        end_f = self.spin_out.value()
-        if start_f > end_f:
-            QMessageBox.warning(self, "トリミング", "開始フレームが終了より後です。")
+        if self.crop_width <= 0 or self.crop_height <= 0:
+            QMessageBox.warning(self, "トリミング", "範囲を指定してください。")
             return
+        h, w = self._current_frame_np.shape[:2]
+        l = max(0, min(self.crop_left, w - 1))
+        t = max(0, min(self.crop_top, h - 1))
+        r = min(w, l + self.crop_width)
+        b = min(h, t + self.crop_height)
+        if r <= l or b <= t:
+            return
+        cropped = self._current_frame_np[t:b, l:r]
+        default_path = self._next_save_path("bonus", "frames", ".png")
         path, _ = QFileDialog.getSaveFileName(
-            self, "トリミング動画を保存", "",
-            "MP4 (*.mp4);;AVI (*.avi);;All (*.*)"
+            self, "トリミング範囲を画像で保存", default_path,
+            "PNG (*.png);;JPEG (*.jpg);;All (*.*)"
         )
         if not path:
             return
-        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        if path.lower().endswith(".avi"):
-            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        out = cv2.VideoWriter(path, fourcc, self.fps, (w, h))
-        if not out.isOpened():
-            QMessageBox.critical(self, "トリミング", "動画の書き出しを開始できませんでした。")
-            return
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
-        for _ in range(end_f - start_f + 1):
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                break
-            out.write(frame)
-        out.release()
-        QMessageBox.information(self, "トリミング", f"保存しました: {path}")
+        p = Path(path).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        ext = (p.suffix.lower() or ".png").replace(".jpeg", ".jpg")
+        if ext not in (".png", ".jpg"):
+            ext = ".png"
+        _, buf = cv2.imencode(ext, cropped)
+        try:
+            if buf is not None:
+                p.write_bytes(buf.tobytes())
+                QMessageBox.information(self, "トリミング", f"保存しました: {p}")
+            else:
+                QMessageBox.critical(self, "トリミング", "保存に失敗しました。")
+        except OSError as e:
+            QMessageBox.critical(self, "トリミング", f"保存に失敗しました: {e}")
 
     def closeEvent(self, event):
         self._close_capture()
@@ -584,7 +808,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     w = VideoToolWindow()
-    w.show()
+    w.showMaximized()
     sys.exit(app.exec())
 
 

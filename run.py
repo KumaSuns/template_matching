@@ -20,7 +20,7 @@ from PySide6.QtGui import QFont
 
 # フォルダ名 → 表示名。新しいシステムを追加したらここに追加する
 SYSTEMS = [
-    ("template_matching", "テンプレートマッチング（画像）"),
+    ("analyzer", "analyzer"),
     ("video_tool", "動画ツール"),
 ]
 
