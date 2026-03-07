@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
+    QStyleFactory,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -202,7 +203,7 @@ class VideoToolWindow(QMainWindow):
         open_area = QFrame()
         open_area.setFrameStyle(QFrame.StyledPanel)
         open_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
-        open_area.setFixedHeight(48)
+        open_area.setMinimumHeight(48)
         open_area_layout = QHBoxLayout(open_area)
         open_area_layout.setContentsMargins(6, 6, 6, 6)
         self.btn_open = QPushButton("動画を開く")
@@ -216,9 +217,9 @@ class VideoToolWindow(QMainWindow):
         video_area = QFrame()
         video_area.setFrameStyle(QFrame.StyledPanel)
         video_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
-        video_area.setMinimumSize(560, 720)
-        video_area.setFixedHeight(720)
-        video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        video_area.setMinimumSize(560, 400)
+        video_area.setMinimumHeight(400)
+        video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         vl = QVBoxLayout(video_area)
         vl.setContentsMargins(0, 0, 0, 0)
         self.label_video = QLabel()
@@ -300,16 +301,16 @@ class VideoToolWindow(QMainWindow):
         right_open_area = QFrame()
         right_open_area.setFrameStyle(QFrame.StyledPanel)
         right_open_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
-        right_open_area.setFixedHeight(48)
+        right_open_area.setMinimumHeight(48)
         right_open_area_layout = QHBoxLayout(right_open_area)
         right_open_area_layout.setContentsMargins(6, 6, 6, 6)
         right_layout.addWidget(right_open_area)
         right_video_area = QFrame()
         right_video_area.setFrameStyle(QFrame.StyledPanel)
         right_video_area.setStyleSheet("QFrame { border: 1px solid #ddd; }")
-        right_video_area.setMinimumSize(260, 720)
-        right_video_area.setFixedHeight(720)
-        right_video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        right_video_area.setMinimumSize(260, 400)
+        right_video_area.setMinimumHeight(400)
+        right_video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_video_layout = QVBoxLayout(right_video_area)
         right_video_layout.setContentsMargins(0, 0, 0, 0)
         self.label_crop_preview = QLabel()
@@ -833,9 +834,37 @@ class VideoToolWindow(QMainWindow):
         event.accept()
 
 
+def _get_platform_stylesheet():
+    """Mac のときは Fusion を Mac 風に見せるスタイル。Windows では空."""
+    if sys.platform != "darwin":
+        return ""
+    return """
+        QMainWindow, QWidget { background-color: #f5f5f7; }
+        QPushButton { background-color: #fff; border: 1px solid #d2d2d7; border-radius: 6px; padding: 6px 12px; }
+        QPushButton:hover { background-color: #e8e8ed; }
+        QPushButton:pressed { background-color: #d2d2d7; }
+        QGroupBox { font-weight: 600; color: #1d1d1f; border: 1px solid #d2d2d7; border-radius: 6px; margin-top: 10px; padding: 8px 8px 4px 8px; background: #f5f5f7; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+        QFrame { border: 1px solid #d2d2d7; border-radius: 4px; background-color: #fff; }
+        QSlider::groove:horizontal { height: 6px; border-radius: 3px; background: #e8e8ed; }
+        QSlider::handle:horizontal { width: 16px; margin: -5px 0; border-radius: 8px; background: #fff; border: 1px solid #d2d2d7; }
+        QSlider::handle:horizontal:hover { background: #e8e8ed; }
+        QSpinBox, QComboBox { background: #fff; border: 1px solid #d2d2d7; border-radius: 6px; padding: 4px 8px; min-height: 20px; }
+        QLabel { color: #1d1d1f; }
+    """
+
+
 def main():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    if sys.platform == "darwin":
+        mac_style = QStyleFactory.create("macos")
+        if mac_style is not None:
+            app.setStyle(mac_style)
+        else:
+            app.setStyle("Fusion")
+            app.setStyleSheet(_get_platform_stylesheet())
+    else:
+        app.setStyle("Fusion")
     w = VideoToolWindow()
     w.showMaximized()
     sys.exit(app.exec())

@@ -1,6 +1,7 @@
 # analyzer_dl 用
 PySide6>=6.5.0
-opencv-python>=4.8.0
+numpy
+opencv-python>=4.10.0
 # 学習用
 torch>=2.0.0
 torchvision>=0.15.0

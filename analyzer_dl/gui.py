@@ -59,21 +59,29 @@ def cv2_to_qpixmap(bgr_image, scale_w: int = 0, scale_h: int = 0):
 
 
 def load_dl_model(path: str):
-    """model.pth を読み込み (model, classes_list) を返す。失敗時は None, []"""
+    """model.pth を読み込み (model, classes_list, error_message) を返す。失敗時は None, [], エラー文"""
     if not _TORCH_AVAILABLE:
-        return None, []
+        return None, [], "torch がインストールされていません"
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict):
+            return None, [], "チェックポイントが辞書形式ではありません"
         classes_list = ckpt.get("classes", [])
         num_classes = ckpt.get("num_classes", len(classes_list))
         if not classes_list or num_classes <= 0:
-            return None, []
+            return None, [], "チェックポイントに classes がありません"
+        if "model_state_dict" not in ckpt:
+            return None, [], "チェックポイントに model_state_dict がありません"
         model = build_model(num_classes, pretrained=False)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        state_dict = ckpt["model_state_dict"]
+        # DataParallel で保存した場合の "module." プレフィックスを外す
+        if next(iter(state_dict.keys()), "").startswith("module."):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
-        return model, classes_list
-    except Exception:
-        return None, []
+        return model, classes_list, None
+    except Exception as e:
+        return None, [], str(e)
 
 
 class TrainThread(QThread):
@@ -466,9 +474,12 @@ class AnalyzerDLWindow(QMainWindow):
             return
         self._last_model_dir = str(Path(path).parent)
         self._settings.setValue("lastModelDir", self._last_model_dir)
-        model, classes_list = load_dl_model(path)
+        model, classes_list, err = load_dl_model(path)
         if model is None or not classes_list:
-            QMessageBox.warning(self, "モデル", "モデルを読み込めませんでした。")
+            msg = "モデルを読み込めませんでした。"
+            if err:
+                msg += f"\n\n{err}"
+            QMessageBox.warning(self, "モデル", msg)
             return
         self._settings.setValue("lastModelPath", path)
         self.dl_model = model
@@ -484,9 +495,12 @@ class AnalyzerDLWindow(QMainWindow):
         """指定パスのモデルを読み込む（ファイルダイアログなし）"""
         if not path or not Path(path).is_file():
             return
-        model, classes_list = load_dl_model(path)
+        model, classes_list, err = load_dl_model(path)
         if model is None or not classes_list:
-            QMessageBox.warning(self, "モデル", "モデルを読み込めませんでした。")
+            msg = "モデルを読み込めませんでした。"
+            if err:
+                msg += f"\n\n{err}"
+            QMessageBox.warning(self, "モデル", msg)
             return
         self._settings.setValue("lastModelPath", path)
         self.dl_model = model

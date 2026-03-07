@@ -2,12 +2,19 @@
 
 やりたいことをフォルダごとに分けているリポジトリです。各システムは PySide6 で GUI 化されています。
 
+## Python バージョン
+
+**PySide6 は Python 3.8〜3.12 を推奨しています。** 3.13 や 3.14 ではビルドが用意されていない場合があります。その場合は Python 3.12 で仮想環境を作ってください（例: `brew install python@3.12` のあと `python3.12 -m venv .venv`）。
+
 ## 起動方法
 
 **ランチャーから起動（推奨）**
 
 ```bash
-pip install -r requirements.txt   # ルートで PySide6 をインストール
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install -r analyzer_dl/requirements.txt   # analyzer (DL) を使う場合
 python run.py
 ```
 
