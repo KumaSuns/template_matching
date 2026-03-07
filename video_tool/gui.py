@@ -171,6 +171,7 @@ class VideoToolWindow(QMainWindow):
         self._last_paint_time = 0.0
         _settings = QSettings("template_matching", "video_tool")
         self._last_video_dir = _settings.value("lastVideoDir", "", type=str)
+        self._last_capture_dir = _settings.value("lastCaptureDir", "", type=str)
         _templates = Path(__file__).resolve().parent.parent / "templates"
         self._templates_dir = str(_templates)
         self._template_categories = ("bonus", "fever", "go", "result", "skill", "timeup")
@@ -731,6 +732,24 @@ class VideoToolWindow(QMainWindow):
                     pass
         return str(dir_path / f"{prefix}{max_n + 1:03d}{ext}")
 
+    def _next_capture_path(self, dir_path: Path, prefix: str, ext: str) -> str:
+        """指定フォルダ内で prefix_001, prefix_002 の次の番号のパスを返す"""
+        dir_path = Path(dir_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        head = f"{prefix}_"
+        max_n = 0
+        for f in dir_path.iterdir():
+            if not f.is_file():
+                continue
+            if f.stem.startswith(head) and f.suffix:
+                try:
+                    n = int(f.stem[len(head):])
+                    if n > max_n:
+                        max_n = n
+                except ValueError:
+                    pass
+        return str(dir_path / f"{head}{max_n + 1:03d}{ext}")
+
     def capture_frame(self):
         if self.cap is None:
             return
@@ -739,7 +758,10 @@ class VideoToolWindow(QMainWindow):
         if not ret or frame is None:
             QMessageBox.warning(self, "キャプチャ", "フレームを取得できませんでした。")
             return
-        default_path = self._next_save_path("bonus", "frames", ".png")
+        if self._last_capture_dir and Path(self._last_capture_dir).is_dir():
+            default_path = self._next_capture_path(Path(self._last_capture_dir), "frame", ".png")
+        else:
+            default_path = self._next_save_path("bonus", "frames", ".png")
         path, _ = QFileDialog.getSaveFileName(
             self, "画像を保存", default_path,
             "PNG (*.png);;JPEG (*.jpg);;All (*.*)"
@@ -755,6 +777,8 @@ class VideoToolWindow(QMainWindow):
         try:
             if buf is not None:
                 p.write_bytes(buf.tobytes())
+                self._last_capture_dir = str(p.parent)
+                QSettings("template_matching", "video_tool").setValue("lastCaptureDir", self._last_capture_dir)
                 QMessageBox.information(self, "キャプチャ", f"保存しました: {p}")
             else:
                 QMessageBox.critical(self, "キャプチャ", "保存に失敗しました。")
@@ -777,7 +801,10 @@ class VideoToolWindow(QMainWindow):
         if r <= l or b <= t:
             return
         cropped = self._current_frame_np[t:b, l:r]
-        default_path = self._next_save_path("bonus", "frames", ".png")
+        if self._last_capture_dir and Path(self._last_capture_dir).is_dir():
+            default_path = self._next_capture_path(Path(self._last_capture_dir), "trim", ".png")
+        else:
+            default_path = self._next_save_path("bonus", "frames", ".png")
         path, _ = QFileDialog.getSaveFileName(
             self, "トリミング範囲を画像で保存", default_path,
             "PNG (*.png);;JPEG (*.jpg);;All (*.*)"
@@ -793,6 +820,8 @@ class VideoToolWindow(QMainWindow):
         try:
             if buf is not None:
                 p.write_bytes(buf.tobytes())
+                self._last_capture_dir = str(p.parent)
+                QSettings("template_matching", "video_tool").setValue("lastCaptureDir", self._last_capture_dir)
                 QMessageBox.information(self, "トリミング", f"保存しました: {p}")
             else:
                 QMessageBox.critical(self, "トリミング", "保存に失敗しました。")

@@ -21,6 +21,7 @@ from PySide6.QtGui import QFont
 # フォルダ名 → 表示名。新しいシステムを追加したらここに追加する
 SYSTEMS = [
     ("analyzer", "analyzer"),
+    ("analyzer_dl", "analyzer (DL)"),
     ("video_tool", "動画ツール"),
 ]
 
