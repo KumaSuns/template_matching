@@ -23,6 +23,7 @@ SYSTEMS = [
     ("analyzer", "analyzer"),
     ("analyzer_dl", "analyzer (DL)"),
     ("video_tool", "動画ツール"),
+    ("data_manager", "データ管理（画像数・動画削除）"),
 ]
 
 

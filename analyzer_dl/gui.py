@@ -373,6 +373,11 @@ class AnalyzerDLWindow(QMainWindow):
         if not _TORCH_AVAILABLE:
             self.btn_detect_dl.setToolTip("torch がインストールされていません")
         right_layout.addWidget(self.btn_detect_dl)
+        self.btn_predict_current = QPushButton("現在フレームを判定")
+        self.btn_predict_current.clicked.connect(self.predict_current_frame)
+        if not _TORCH_AVAILABLE:
+            self.btn_predict_current.setToolTip("torch がインストールされていません")
+        right_layout.addWidget(self.btn_predict_current)
         self.label_progress = QLabel("")
         right_layout.addWidget(self.label_progress)
         self.progress_bar = QProgressBar()
@@ -396,6 +401,7 @@ class AnalyzerDLWindow(QMainWindow):
     def update_ui_state(self, has_video: bool):
         busy = self._dl_cap is not None
         self.btn_detect_dl.setEnabled(has_video and not busy and _TORCH_AVAILABLE and bool(self._dl_model_path))
+        self.btn_predict_current.setEnabled(has_video and not busy and _TORCH_AVAILABLE and bool(self._dl_model_path))
         self.btn_load_model.setEnabled(not busy)
         self.slider_seek.setEnabled(has_video)
         self.spin_step.setEnabled(has_video)
@@ -546,6 +552,38 @@ class AnalyzerDLWindow(QMainWindow):
         self._dl_step_index = 0
         self._dl_prev_cls = "none"
         self._dl_timer.start(0)
+
+    def predict_current_frame(self):
+        """表示中のフレームを1枚だけ判定し、結果を表示する（検知されない原因の確認用）"""
+        if not self.cap or not self.dl_model or not self.dl_classes:
+            QMessageBox.warning(self, "判定", "動画とモデルを読み込んでください。")
+            return
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame_index)
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            QMessageBox.warning(self, "判定", "フレームを読み込めませんでした。")
+            return
+        try:
+            img = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            x = torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+            x = (x - self._norm_mean) / self._norm_std
+            with torch.no_grad():
+                logits = self.dl_model(x)
+                probs = torch.softmax(logits, dim=1)
+                pred_idx = int(logits.argmax(dim=1).item())
+            cls_name = self.dl_classes[pred_idx] if pred_idx < len(self.dl_classes) else "?"
+            conf = float(probs[0, pred_idx].item())
+            lines = [f"予測: {cls_name}  (信頼度 {conf:.2%})", f"フレーム #{self.current_frame_index}  {self._frame_to_time(self.current_frame_index)}"]
+            lines.append("")
+            lines.append("各クラスの信頼度:")
+            for i, name in enumerate(self.dl_classes):
+                if i < probs.shape[1]:
+                    lines.append(f"  {name}: {probs[0, i].item():.2%}")
+            QMessageBox.information(self, "現在フレームの判定", "\n".join(lines))
+        except Exception as e:
+            QMessageBox.critical(self, "判定エラー", str(e))
 
     def _dl_timer_tick(self):
         if self._dl_cap is None:
