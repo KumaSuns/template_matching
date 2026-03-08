@@ -1,0 +1,45 @@
+---
+description: Git のコミットで自宅/会社を判別するルール（自宅=for_windows・会社=for_mac）
+alwaysApply: false
+---
+
+# Git 作業場所のルール
+
+- **自宅（Windows）**: 場所タグは `for_windows`
+- **会社（Mac）**: 場所タグは `for_mac`
+
+## 設定方法（どちらか一方でOK）
+
+### 方法1: user.name で分ける（おすすめ）
+
+各マシンで1回だけ設定する。
+
+**自宅の Windows で:**
+```bash
+git config --global user.name "あなたの名前 (for_windows)"
+```
+
+**会社の Mac で:**
+```bash
+git config --global user.name "あなたの名前 (for_mac)"
+```
+
+`git log` の作者名で「for_windows」か「for_mac」か判別できる。
+
+### 方法2: コミットメッセージに手で付ける
+
+コミット時に先頭に `[for_windows]` または `[for_mac]` を付ける。
+
+例: `[for_windows] モデル更新` / `[for_mac] データ追加`
+
+---
+
+## 忘れないように（会社の Mac で初回だけ）
+
+会社の Mac でこのリポジトリを触るときは、**1回だけ** 次を実行する:
+
+```bash
+git config --global user.name "あなたの名前 (for_mac)"
+```
+
+これをやっておかないと `git log` で自宅/会社の判別ができない。
