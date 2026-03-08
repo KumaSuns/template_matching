@@ -26,7 +26,14 @@ def check_load(path: Path):
         print("キー:", list(ckpt.keys()))
         classes = ckpt.get("classes", [])
         num_classes = ckpt.get("num_classes", len(classes))
-        print("クラス数:", num_classes, "クラス:", classes)
+        print("クラス数:", num_classes)
+        print("クラス一覧(インデックス=予測の番号):", ", ".join(f"{i}:{c}" for i, c in enumerate(classes)))
+        try:
+            from classes import CLASSES
+            if classes != CLASSES:
+                print("注意: このモデルのクラス順は、現在の classes.py と異なります。学習時の classes.py の順序で保存されています。")
+        except Exception:
+            pass
         state = ckpt.get("model_state_dict")
         if not state:
             print("エラー: model_state_dict がありません")

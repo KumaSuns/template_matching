@@ -5,8 +5,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np  # OpenCV より先に import
 import cv2
-import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QEvent, QTimer
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (

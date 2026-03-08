@@ -1,7 +1,7 @@
-# analyzer_dl 用
+# analyzer_dl 用（「Numpy is not available」対策: numpy 1.x + opencv-headless）
 PySide6>=6.5.0
-numpy
-opencv-python>=4.10.0
+numpy>=1.24,<2
+opencv-python-headless>=4.8.0
 # 学習用
 torch>=2.0.0
 torchvision>=0.15.0

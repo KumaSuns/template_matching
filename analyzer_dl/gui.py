@@ -9,6 +9,7 @@ _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
+import numpy as np  # OpenCV より先に import（検出実行時の「Numpy is not available」対策）
 import cv2
 from PySide6.QtCore import Qt, QSettings, QTimer, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QSpinBox,
+    QDoubleSpinBox,
     QComboBox,
     QSplitter,
     QFrame,
@@ -83,6 +85,38 @@ def load_dl_model(path: str):
         return model, classes_list, None
     except Exception as e:
         return None, [], str(e)
+
+
+class AddToDataDialog(QDialog):
+    """検出結果のフレームをどのクラスで保存するか指定するダイアログ"""
+    def __init__(self, parent, frame_index: int, detected_cls: str, score: float, classes: list, train_dir: str, val_dir: str):
+        super().__init__(parent)
+        self.setWindowTitle("データに追加")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"フレーム #{frame_index}（検出: {detected_cls} {score:.2f}）を、どのクラスとして保存しますか？"))
+        self.combo_class = QComboBox()
+        self.combo_class.addItems(classes)
+        idx = self.combo_class.findText(detected_cls)
+        if idx >= 0:
+            self.combo_class.setCurrentIndex(idx)
+        layout.addWidget(QLabel("クラス:"))
+        layout.addWidget(self.combo_class)
+        self.combo_subset = QComboBox()
+        self.combo_subset.addItem("train", False)
+        self.combo_subset.addItem("val", True)
+        layout.addWidget(QLabel("保存先:"))
+        layout.addWidget(self.combo_subset)
+        layout.addWidget(QLabel(f"  train → {train_dir}\n  val   → {val_dir}"))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def get_selected_class(self) -> str:
+        return self.combo_class.currentText()
+
+    def get_use_val(self) -> bool:
+        return self.combo_subset.currentData()
 
 
 class TrainThread(QThread):
@@ -305,8 +339,13 @@ class AnalyzerDLWindow(QMainWindow):
         self._last_model_dir = self._settings.value("lastModelDir", str(Path(__file__).resolve().parent), type=str)
         self._last_export_dir = self._settings.value("lastExportDir", "", type=str) or str(Path(__file__).resolve().parent)
         _mp = self._settings.value("modelPaths", [])
-        self._model_paths = (_mp if isinstance(_mp, list) else [])[:15]
-        self._model_paths = [str(p) for p in self._model_paths if p and Path(str(p)).is_file()][:15]
+        if isinstance(_mp, list):
+            _model_paths_raw = _mp
+        elif isinstance(_mp, str) and _mp:
+            _model_paths_raw = [s.strip() for s in _mp.split("|") if s.strip()]
+        else:
+            _model_paths_raw = []
+        self._model_paths = [str(p) for p in _model_paths_raw[:15] if p and Path(str(p)).is_file()]
         self.setWindowTitle("analyzer (DL)")
         self.setMinimumSize(900, 600)
         self.setup_ui()
@@ -418,6 +457,30 @@ class AnalyzerDLWindow(QMainWindow):
         self.spin_step.valueChanged.connect(self._save_step_setting)
         opts.addWidget(self.spin_step)
         right_layout.addLayout(opts)
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel("信頼度:"))
+        self.spin_conf = QDoubleSpinBox()
+        self.spin_conf.setMinimum(0.0)
+        self.spin_conf.setMaximum(1.0)
+        self.spin_conf.setSingleStep(0.05)
+        self.spin_conf.setDecimals(2)
+        self.spin_conf.setValue(self._settings.value("detectConfThreshold", 0.3, type=float))
+        self.spin_conf.valueChanged.connect(self._save_conf_setting)
+        self.spin_conf.setToolTip("この値以上の信頼度の予測だけを検出として表示します（精度向上用）")
+        conf_row.addWidget(self.spin_conf)
+        right_layout.addLayout(conf_row)
+        margin_row = QHBoxLayout()
+        margin_row.addWidget(QLabel("noneとの差:"))
+        self.spin_none_margin = QDoubleSpinBox()
+        self.spin_none_margin.setMinimum(0.0)
+        self.spin_none_margin.setMaximum(1.0)
+        self.spin_none_margin.setSingleStep(0.05)
+        self.spin_none_margin.setDecimals(2)
+        self.spin_none_margin.setValue(self._settings.value("detectNoneMargin", 0.05, type=float))
+        self.spin_none_margin.valueChanged.connect(self._save_none_margin_setting)
+        self.spin_none_margin.setToolTip("go/timeup/result は、none の信頼度よりこの値以上高いときだけ検出。0=オフ。go が一枚も出ないときは 0 に、none が go と出るなら 0.15〜0.25 に")
+        margin_row.addWidget(self.spin_none_margin)
+        right_layout.addLayout(margin_row)
         self.btn_detect_dl = QPushButton("検出実行")
         self.btn_detect_dl.clicked.connect(self.run_detect_dl)
         if not _TORCH_AVAILABLE:
@@ -435,10 +498,17 @@ class AnalyzerDLWindow(QMainWindow):
         right_layout.addWidget(self.progress_bar)
         self.list_results = QListWidget()
         self.list_results.itemClicked.connect(self.on_result_clicked)
+        self.list_results.itemSelectionChanged.connect(self._on_result_selection_changed)
         right_layout.addWidget(self.list_results, 1)
+        btn_row = QHBoxLayout()
+        self.btn_add_to_data = QPushButton("データに追加")
+        self.btn_add_to_data.setToolTip("選択した検出結果のフレームを、指定クラスで学習用データに保存します")
+        self.btn_add_to_data.clicked.connect(self.add_selected_result_to_data)
+        btn_row.addWidget(self.btn_add_to_data)
         self.btn_export = QPushButton("結果を保存（CSV）")
         self.btn_export.clicked.connect(self.export_results_csv)
-        right_layout.addWidget(self.btn_export)
+        btn_row.addWidget(self.btn_export)
+        right_layout.addLayout(btn_row)
         splitter.addWidget(right)
 
         splitter.setSizes([500, 320])
@@ -447,6 +517,12 @@ class AnalyzerDLWindow(QMainWindow):
 
     def _save_step_setting(self, value: int):
         self._settings.setValue("detectFrameStep", value)
+
+    def _save_conf_setting(self, value: float):
+        self._settings.setValue("detectConfThreshold", value)
+
+    def _save_none_margin_setting(self, value: float):
+        self._settings.setValue("detectNoneMargin", value)
 
     def _refresh_model_combo(self):
         self.combo_models.blockSignals(True)
@@ -495,6 +571,8 @@ class AnalyzerDLWindow(QMainWindow):
         self.btn_accuracy_check.setEnabled(not busy and not check_busy and _TORCH_AVAILABLE and bool(self._dl_model_path))
         self.combo_models.setEnabled(not busy)
         self.btn_add_model.setEnabled(not busy)
+        has_sel = self.list_results.currentItem() is not None
+        self.btn_add_to_data.setEnabled(not busy and has_video and has_sel)
         self.slider_seek.setEnabled(has_video)
         self.spin_step.setEnabled(has_video)
         for btn in getattr(self, "step_buttons", []):
@@ -588,12 +666,13 @@ class AnalyzerDLWindow(QMainWindow):
         if path_str not in self._model_paths:
             self._model_paths.insert(0, path_str)
             self._model_paths = self._model_paths[:15]
-            self._settings.setValue("modelPaths", self._model_paths)
-        self.dl_model = model
+            self._settings.setValue("modelPaths", "|".join(self._model_paths))
+        self._dl_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dl_model = model.to(self._dl_device)
         self.dl_classes = classes_list
         self._dl_model_path = path_str
-        self._norm_mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
-        self._norm_std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1)
+        self._norm_mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32, device=self._dl_device).view(1, 3, 1, 1)
+        self._norm_std = torch.tensor(IMAGENET_STD, dtype=torch.float32, device=self._dl_device).view(1, 3, 1, 1)
         self._refresh_model_combo()
         self.combo_models.setToolTip(path_str)
         self._update_model_status(path_str)
@@ -603,13 +682,20 @@ class AnalyzerDLWindow(QMainWindow):
         if not path or not Path(path).is_file():
             self.label_model_status.setText("（未読み込み）")
             return
+        lines = [f"使用中: {Path(path).name}"]
         try:
             mtime = Path(path).stat().st_mtime
             from datetime import datetime
             dt = datetime.fromtimestamp(mtime)
-            self.label_model_status.setText(f"使用中: {Path(path).name}\n更新: {dt.strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"更新: {dt.strftime('%Y-%m-%d %H:%M')}")
         except Exception:
-            self.label_model_status.setText(f"使用中: {Path(path).name}")
+            pass
+        if getattr(self, "dl_classes", None):
+            # モデル内のクラス順（0=none かどうか確認用）
+            lines.append("クラス(0から): " + ", ".join(f"{i}:{c}" for i, c in enumerate(self.dl_classes)))
+        if getattr(self, "_dl_device", None):
+            lines.append(f"推論: {self._dl_device.type}")
+        self.label_model_status.setText("\n".join(lines))
 
     def _run_accuracy_check(self):
         if not self.dl_model or not self.dl_classes:
@@ -663,6 +749,43 @@ class AnalyzerDLWindow(QMainWindow):
             self.update_ui_state(self.cap is not None)
             QMessageBox.critical(self, "DL検出", "動画を開けませんでした。")
             return
+        # OpenCV と NumPy の互換性チェック（検出実行時に「Numpy is not available」が出るのを事前検出）
+        try:
+            self._dl_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._dl_cap.read()
+            if ret and frame is not None:
+                _ = np.asarray(frame, dtype=np.uint8)
+                torch.from_numpy(_).numel()
+        except Exception as e:
+            err_msg = str(e).lower()
+            self._dl_cap.release()
+            self._dl_cap = None
+            self.progress_bar.setVisible(False)
+            self.update_ui_state(self.cap is not None)
+            err_path = _script_dir / "last_error.txt"
+            try:
+                err_path.write_text(f"{type(e).__name__}: {e}", encoding="utf-8")
+            except Exception:
+                pass
+            if "numpy" in err_msg or "array" in err_msg or "multiarray" in err_msg or "numpy is not available" in err_msg:
+                QMessageBox.critical(
+                    self, "DL検出",
+                    "「Numpy is not available」が発生しました。\n\n"
+                    "ターミナルで次を実行してください（opencv-python の代わりに headless 版を試します）:\n\n"
+                    "  .venv/bin/pip uninstall opencv-python opencv-python-headless -y\n"
+                    "  .venv/bin/pip install \"numpy>=1.24,<2\"\n"
+                    "  .venv/bin/pip install opencv-python-headless\n\n"
+                    "それでも出る場合は、opencv-python に戻して:\n"
+                    "  .venv/bin/pip uninstall opencv-python-headless -y\n"
+                    "  .venv/bin/pip install opencv-python\n\n"
+                    f"詳細は {err_path.name} に保存しました。"
+                )
+            else:
+                QMessageBox.critical(
+                    self, "DL検出",
+                    f"検出の準備中にエラーが発生しました。\n詳細は {err_path.name} に保存しました。"
+                )
+            return
         self._dl_step_index = 0
         self._dl_prev_cls = "none"
         self._dl_timer.start(0)
@@ -681,7 +804,8 @@ class AnalyzerDLWindow(QMainWindow):
             img = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            x = torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+            img = np.asarray(img, dtype=np.uint8)
+            x = torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255.0).unsqueeze(0).to(self._dl_device)
             x = (x - self._norm_mean) / self._norm_std
             with torch.no_grad():
                 logits = self.dl_model(x)
@@ -697,7 +821,12 @@ class AnalyzerDLWindow(QMainWindow):
                     lines.append(f"  {name}: {probs[0, i].item():.2%}")
             QMessageBox.information(self, "現在フレームの判定", "\n".join(lines))
         except Exception as e:
-            QMessageBox.critical(self, "判定エラー", str(e))
+            err_path = _script_dir / "last_error.txt"
+            try:
+                err_path.write_text(f"{type(e).__name__}: {e}", encoding="utf-8")
+            except Exception:
+                pass
+            QMessageBox.critical(self, "判定エラー", f"詳細は {err_path.name} に保存しました。")
 
     def _dl_timer_tick(self):
         if self._dl_cap is None:
@@ -718,7 +847,8 @@ class AnalyzerDLWindow(QMainWindow):
             img = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            x = torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+            img = np.asarray(img, dtype=np.uint8)
+            x = torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255.0).unsqueeze(0).to(self._dl_device)
             x = (x - self._norm_mean) / self._norm_std
             with torch.no_grad():
                 logits = self.dl_model(x)
@@ -726,12 +856,22 @@ class AnalyzerDLWindow(QMainWindow):
                 pred_idx = int(logits.argmax(dim=1).item())
                 conf = float(probs[0, pred_idx].item())
             cls_name = self.dl_classes[pred_idx] if pred_idx < len(self.dl_classes) else "?"
-            if cls_name != "none" and (self._dl_prev_cls != cls_name or self._dl_prev_cls == "none"):
+            conf_threshold = self.spin_conf.value()
+            margin = self.spin_none_margin.value()
+            none_idx = next((i for i, c in enumerate(self.dl_classes) if c == "none"), None)
+            prob_none = float(probs[0, none_idx].item()) if none_idx is not None and none_idx < probs.shape[1] else 0.0
+            above_none = (conf - prob_none) >= margin
+            if cls_name != "none" and conf >= conf_threshold and above_none and (self._dl_prev_cls != cls_name or self._dl_prev_cls == "none"):
                 self._on_result_item(frame_index, cls_name, conf)
             self._dl_prev_cls = cls_name
         except Exception as e:
             self._dl_finish()
-            QMessageBox.critical(self, "DL検出エラー", str(e))
+            err_path = _script_dir / "last_error.txt"
+            try:
+                err_path.write_text(f"{type(e).__name__}: {e}", encoding="utf-8")
+            except Exception:
+                pass
+            QMessageBox.critical(self, "DL検出エラー", f"詳細は {err_path.name} に保存しました。")
             return
         self._dl_step_index += 1
         self._on_progress(self._dl_step_index, self._dl_num_steps)
@@ -766,6 +906,65 @@ class AnalyzerDLWindow(QMainWindow):
             return
         frame_index = data[0] if isinstance(data, tuple) else data
         self._show_frame_at(int(frame_index))
+
+    def _on_result_selection_changed(self):
+        self.update_ui_state(self.cap is not None)
+
+    def add_selected_result_to_data(self):
+        """選択した検出結果のフレームを、指定クラスで data/train または data/val に保存する"""
+        item = self.list_results.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "データに追加", "検出結果の一覧で、追加したい行を選択してください。")
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, tuple) or len(data) != 3:
+            return
+        frame_index, detected_cls, score = data
+        if not self.video_path or not Path(self.video_path).is_file():
+            QMessageBox.warning(self, "データに追加", "動画が開かれていません。")
+            return
+        if not self.dl_classes:
+            QMessageBox.warning(self, "データに追加", "モデルが読み込まれていません。")
+            return
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            QMessageBox.critical(self, "データに追加", "動画を開けませんでした。")
+            return
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            QMessageBox.warning(self, "データに追加", "フレームを読み込めませんでした。")
+            return
+        data_dir = _script_dir / "data"
+        train_dir = data_dir / "train"
+        val_dir = data_dir / "val"
+        dialog = AddToDataDialog(
+            self, frame_index, detected_cls, score, list(self.dl_classes),
+            str(train_dir), str(val_dir)
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        class_name = dialog.get_selected_class()
+        use_val = dialog.get_use_val()
+        if not class_name:
+            return
+        dest_dir = (val_dir if use_val else train_dir) / class_name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        base = dest_dir / f"frame_{frame_index:06d}"
+        path = base.with_suffix(".png")
+        n = 0
+        while path.exists():
+            n += 1
+            path = base.parent / f"{base.stem}_{n}.png"
+        try:
+            cv2.imwrite(str(path), frame)
+            QMessageBox.information(
+                self, "データに追加",
+                f"保存しました:\n{path}\n\nクラス: {class_name}\n{'val' if use_val else 'train'}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "データに追加", f"保存に失敗しました:\n{e}")
 
     def export_results_csv(self):
         if self.list_results.count() == 0:

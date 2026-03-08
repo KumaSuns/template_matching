@@ -61,14 +61,27 @@ def get_platform_stylesheet(platform: str) -> str:
     return ""
 
 
+def _get_python_for_launch(folder_name: str) -> str:
+    """ツール起動に使う Python。.venv があればそれを優先（torch 等が入っている想定）。"""
+    root = get_root_dir()
+    if sys.platform == "win32":
+        venv_python = os.path.join(root, ".venv", "Scripts", "python.exe")
+    else:
+        venv_python = os.path.join(root, ".venv", "bin", "python")
+    if os.path.isfile(venv_python):
+        return venv_python
+    return sys.executable
+
+
 def launch_system(folder_name: str):
     root = get_root_dir()
     folder_path = os.path.join(root, folder_name)
     gui_py = os.path.join(folder_path, "gui.py")
     if not os.path.isfile(gui_py):
         return
+    python_exe = _get_python_for_launch(folder_name)
     subprocess.Popen(
-        [sys.executable, "gui.py"],
+        [python_exe, "gui.py"],
         cwd=folder_path,
         creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
     )
