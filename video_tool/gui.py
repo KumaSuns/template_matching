@@ -228,6 +228,9 @@ class VideoToolWindow(QMainWindow):
         self.label_video.setText("動画を開いてください")
         self.label_video.setMouseTracking(True)
         self.label_video.installEventFilter(self)
+        self.label_video.setScaledContents(False)
+        self.label_video.setMaximumSize(1920, 1080)
+        self.label_video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         vl.addWidget(self.label_video)
         left_layout.addWidget(video_area)
 
@@ -489,10 +492,13 @@ class VideoToolWindow(QMainWindow):
         self.slider_seek.blockSignals(False)
 
     def _display_size(self):
+        """動画表示用サイズ。枠が再生で大きくなり続けないよう上限をかける"""
         w = self.label_video.width()
         h = self.label_video.height()
         if w <= 0 or h <= 0:
             return 0, 0
+        w = min(w, 1920)
+        h = min(h, 1080)
         return w, h
 
     def _label_to_video_coords(self, lx: float, ly: float):

@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QSpinBox,
+    QComboBox,
     QSplitter,
     QFrame,
     QSizePolicy,
@@ -123,6 +124,25 @@ class TrainThread(QThread):
                 self.finished_ok.emit(self.out_path)
         except Exception as e:
             self.finished_with_error.emit(str(e))
+
+
+class AccuracyCheckThread(QThread):
+    """精度チェックを別スレッドで実行"""
+    finished = Signal(bool, str)
+
+    def __init__(self, model, classes: list, data_dir: str):
+        super().__init__()
+        self.model = model
+        self.classes = classes
+        self.data_dir = data_dir
+
+    def run(self):
+        try:
+            from check_model import get_accuracy_result
+            ok, msg = get_accuracy_result(self.model, self.classes, Path(self.data_dir))
+            self.finished.emit(ok, msg)
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 class TrainDialog(QDialog):
@@ -284,13 +304,17 @@ class AnalyzerDLWindow(QMainWindow):
         self._last_video_dir = self._settings.value("lastVideoDir", "", type=str)
         self._last_model_dir = self._settings.value("lastModelDir", str(Path(__file__).resolve().parent), type=str)
         self._last_export_dir = self._settings.value("lastExportDir", "", type=str) or str(Path(__file__).resolve().parent)
+        _mp = self._settings.value("modelPaths", [])
+        self._model_paths = (_mp if isinstance(_mp, list) else [])[:15]
+        self._model_paths = [str(p) for p in self._model_paths if p and Path(str(p)).is_file()][:15]
         self.setWindowTitle("analyzer (DL)")
         self.setMinimumSize(900, 600)
         self.setup_ui()
-        # 前回選択したモデルがあれば自動で読み込む
         last_path = self._settings.value("lastModelPath", "", type=str)
         if last_path and Path(last_path).is_file():
             self.load_model_path(last_path)
+        else:
+            self._update_model_status("")
 
     def setup_ui(self):
         central = QWidget()
@@ -317,12 +341,15 @@ class AnalyzerDLWindow(QMainWindow):
         video_frame = QFrame()
         video_frame.setFrameStyle(QFrame.StyledPanel)
         video_frame.setStyleSheet("QFrame { border: 1px solid #ddd; }")
-        video_frame.setMinimumSize(360, 400)
+        video_frame.setMinimumSize(560, 420)
         vl = QVBoxLayout(video_frame)
         self.label_video = QLabel()
         self.label_video.setAlignment(Qt.AlignCenter)
         self.label_video.setText("動画を開いてください")
         self.label_video.setStyleSheet("color: #999;")
+        self.label_video.setScaledContents(False)
+        self.label_video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.label_video.setMinimumSize(320, 240)
         vl.addWidget(self.label_video)
         left_layout.addWidget(video_frame)
 
@@ -336,6 +363,17 @@ class AnalyzerDLWindow(QMainWindow):
         seek_row.addWidget(self.label_time)
         seek_row.addWidget(self.slider_seek, 1)
         left_layout.addLayout(seek_row)
+        step_row = QHBoxLayout()
+        step_row.addStretch()
+        self.step_buttons = []
+        for label, delta in [("−30", -30), ("−10", -10), ("−5", -5), ("−1", -1), ("+1", 1), ("+5", 5), ("+10", 10), ("+30", 30)]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(44)
+            btn.clicked.connect(lambda checked=False, d=delta: self._frame_step(d))
+            step_row.addWidget(btn)
+            self.step_buttons.append(btn)
+        step_row.addStretch()
+        left_layout.addLayout(step_row)
         splitter.addWidget(left)
 
         right = QWidget()
@@ -349,16 +387,28 @@ class AnalyzerDLWindow(QMainWindow):
         right_layout.addWidget(desc)
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("モデル:"))
-        self.btn_load_model = QPushButton("開く")
-        self.btn_load_model.clicked.connect(self.load_model)
-        model_row.addWidget(self.btn_load_model)
-        self.label_model = QLabel("未読み込み")
-        self.label_model.setStyleSheet("color: #666;")
-        model_row.addWidget(self.label_model, 1)
+        self.combo_models = QComboBox()
+        self.combo_models.setMinimumWidth(120)
+        self._refresh_model_combo()
+        self.combo_models.activated.connect(self._on_model_combo_activated)
+        model_row.addWidget(self.combo_models, 1)
+        self.btn_add_model = QPushButton("追加...")
+        self.btn_add_model.setToolTip("model.pth を開いてリストに追加し、読み込みます")
+        self.btn_add_model.clicked.connect(self._open_add_model_dialog)
+        model_row.addWidget(self.btn_add_model)
         right_layout.addLayout(model_row)
+        self.label_model_status = QLabel("（未読み込み）")
+        self.label_model_status.setStyleSheet("color: #666; font-size: 10px;")
+        self.label_model_status.setWordWrap(True)
+        right_layout.addWidget(self.label_model_status)
         self.btn_train = QPushButton("学習...")
         self.btn_train.clicked.connect(self._open_train_dialog)
         right_layout.addWidget(self.btn_train)
+        self.btn_accuracy_check = QPushButton("精度チェック")
+        self.btn_accuracy_check.clicked.connect(self._run_accuracy_check)
+        if not _TORCH_AVAILABLE:
+            self.btn_accuracy_check.setToolTip("torch がインストールされていません")
+        right_layout.addWidget(self.btn_accuracy_check)
         opts = QHBoxLayout()
         opts.addWidget(QLabel("間隔:"))
         self.spin_step = QSpinBox()
@@ -398,13 +448,57 @@ class AnalyzerDLWindow(QMainWindow):
     def _save_step_setting(self, value: int):
         self._settings.setValue("detectFrameStep", value)
 
+    def _refresh_model_combo(self):
+        self.combo_models.blockSignals(True)
+        self.combo_models.clear()
+        for p in self._model_paths:
+            self.combo_models.addItem(Path(p).name, p)
+        self.combo_models.addItem("追加...", None)
+        idx = -1
+        if self._dl_model_path:
+            for i, p in enumerate(self._model_paths):
+                if p == self._dl_model_path:
+                    idx = i
+                    break
+        if idx >= 0:
+            self.combo_models.setCurrentIndex(idx)
+        else:
+            self.combo_models.setCurrentIndex(max(0, self.combo_models.count() - 1))
+        self.combo_models.setToolTip(self._dl_model_path or "")
+        self.combo_models.blockSignals(False)
+
+    def _open_add_model_dialog(self):
+        """モデルを追加するためのファイルダイアログを開く"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "モデルを追加", self._last_model_dir,
+            "PyTorch (*.pth);;All (*.*)"
+        )
+        if path:
+            self._last_model_dir = str(Path(path).parent)
+            self._settings.setValue("lastModelDir", self._last_model_dir)
+            self.load_model_path(path)
+
+    def _on_model_combo_activated(self, index: int):
+        if index < 0 or index >= self.combo_models.count():
+            return
+        path = self.combo_models.itemData(index)
+        if path is None:
+            self._open_add_model_dialog()
+        else:
+            self.load_model_path(path)
+
     def update_ui_state(self, has_video: bool):
         busy = self._dl_cap is not None
+        check_busy = getattr(self, "_accuracy_thread", None) is not None
         self.btn_detect_dl.setEnabled(has_video and not busy and _TORCH_AVAILABLE and bool(self._dl_model_path))
         self.btn_predict_current.setEnabled(has_video and not busy and _TORCH_AVAILABLE and bool(self._dl_model_path))
-        self.btn_load_model.setEnabled(not busy)
+        self.btn_accuracy_check.setEnabled(not busy and not check_busy and _TORCH_AVAILABLE and bool(self._dl_model_path))
+        self.combo_models.setEnabled(not busy)
+        self.btn_add_model.setEnabled(not busy)
         self.slider_seek.setEnabled(has_video)
         self.spin_step.setEnabled(has_video)
+        for btn in getattr(self, "step_buttons", []):
+            btn.setEnabled(has_video)
 
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -461,7 +555,8 @@ class AnalyzerDLWindow(QMainWindow):
         ret, frame = self.cap.read()
         if ret and frame is not None:
             self._current_frame_np = frame.copy()
-            w, h = self.label_video.width(), self.label_video.height()
+            w = min(self.label_video.width(), 1920)
+            h = min(self.label_video.height(), 1080)
             if w > 0 and h > 0:
                 pix = cv2_to_qpixmap(self._current_frame_np, w, h)
                 self.label_video.setPixmap(pix)
@@ -471,31 +566,11 @@ class AnalyzerDLWindow(QMainWindow):
     def on_seek(self, value: int):
         self._show_frame_at(value)
 
-    def load_model(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "モデルを開く", self._last_model_dir,
-            "PyTorch (*.pth);;All (*.*)"
-        )
-        if not path:
+    def _frame_step(self, delta: int):
+        """コマ送り: delta フレームだけ進める／戻す"""
+        if self.cap is None or self.total_frames == 0:
             return
-        self._last_model_dir = str(Path(path).parent)
-        self._settings.setValue("lastModelDir", self._last_model_dir)
-        model, classes_list, err = load_dl_model(path)
-        if model is None or not classes_list:
-            msg = "モデルを読み込めませんでした。"
-            if err:
-                msg += f"\n\n{err}"
-            QMessageBox.warning(self, "モデル", msg)
-            return
-        self._settings.setValue("lastModelPath", path)
-        self.dl_model = model
-        self.dl_classes = classes_list
-        self._dl_model_path = path
-        self._norm_mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
-        self._norm_std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1)
-        self.label_model.setText(Path(path).name)
-        self.label_model.setToolTip(path)
-        self.update_ui_state(self.cap is not None)
+        self._show_frame_at(max(0, min(self.current_frame_index + delta, self.total_frames - 1)))
 
     def load_model_path(self, path: str):
         """指定パスのモデルを読み込む（ファイルダイアログなし）"""
@@ -509,14 +584,53 @@ class AnalyzerDLWindow(QMainWindow):
             QMessageBox.warning(self, "モデル", msg)
             return
         self._settings.setValue("lastModelPath", path)
+        path_str = str(path)
+        if path_str not in self._model_paths:
+            self._model_paths.insert(0, path_str)
+            self._model_paths = self._model_paths[:15]
+            self._settings.setValue("modelPaths", self._model_paths)
         self.dl_model = model
         self.dl_classes = classes_list
-        self._dl_model_path = path
+        self._dl_model_path = path_str
         self._norm_mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
         self._norm_std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1)
-        self.label_model.setText(Path(path).name)
-        self.label_model.setToolTip(path)
+        self._refresh_model_combo()
+        self.combo_models.setToolTip(path_str)
+        self._update_model_status(path_str)
         self.update_ui_state(self.cap is not None)
+
+    def _update_model_status(self, path: str = ""):
+        if not path or not Path(path).is_file():
+            self.label_model_status.setText("（未読み込み）")
+            return
+        try:
+            mtime = Path(path).stat().st_mtime
+            from datetime import datetime
+            dt = datetime.fromtimestamp(mtime)
+            self.label_model_status.setText(f"使用中: {Path(path).name}\n更新: {dt.strftime('%Y-%m-%d %H:%M')}")
+        except Exception:
+            self.label_model_status.setText(f"使用中: {Path(path).name}")
+
+    def _run_accuracy_check(self):
+        if not self.dl_model or not self.dl_classes:
+            QMessageBox.warning(self, "精度チェック", "先に「追加...」で model.pth を読み込んでください。")
+            return
+        data_dir = _script_dir / "data"
+        if not data_dir.is_dir():
+            QMessageBox.warning(self, "精度チェック", f"データフォルダがありません:\n{data_dir}")
+            return
+        self.btn_accuracy_check.setEnabled(False)
+        self._accuracy_thread = AccuracyCheckThread(self.dl_model, self.dl_classes, str(data_dir))
+        self._accuracy_thread.finished.connect(self._on_accuracy_check_done)
+        self._accuracy_thread.start()
+
+    def _on_accuracy_check_done(self, ok: bool, msg: str):
+        self._accuracy_thread = None
+        self.btn_accuracy_check.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "精度チェック", msg)
+        else:
+            QMessageBox.warning(self, "精度チェック", msg)
 
     def _open_train_dialog(self):
         last_data = self._settings.value("lastDataDir", str(Path(__file__).resolve().parent / "data"), type=str)
@@ -531,7 +645,7 @@ class AnalyzerDLWindow(QMainWindow):
         if not self.video_path or self.total_frames == 0:
             return
         if not self.dl_model or not self.dl_classes:
-            QMessageBox.warning(self, "DL検出", "先に「モデル: 開く」で model.pth を読み込んでください。")
+            QMessageBox.warning(self, "DL検出", "先に「追加...」で model.pth を読み込んでください。")
             return
         step = max(1, self.spin_step.value())
         self._settings.setValue("detectFrameStep", step)

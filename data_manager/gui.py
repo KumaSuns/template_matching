@@ -106,17 +106,32 @@ class DataManagerWindow(QMainWindow):
         layout.addWidget(group_video)
 
     def refresh_counts(self):
-        if not DATA_DIR.is_dir():
-            self.label_counts.setText(f"フォルダがありません:\n{DATA_DIR}")
+        data_dir = Path(__file__).resolve().parent.parent / "analyzer_dl" / "data"
+        self.label_data_path.setText(str(data_dir))
+        if not data_dir.is_dir():
+            self.label_counts.setText(f"フォルダがありません:\n{data_dir}")
+            QApplication.processEvents()
             return
-        rows = get_data_image_counts()
-        total = get_total_count(rows)
-        if not rows:
-            self.label_counts.setText("(train/val にクラスフォルダがありません)")
-            return
-        lines = [f"{label}: {n} 枚" for label, n in rows]
-        lines.append(f"--- 合計: {total} 枚 ---")
-        self.label_counts.setText("\n".join(lines))
+        try:
+            rows = []
+            for sub in ("train", "val"):
+                base = data_dir / sub
+                if not base.is_dir():
+                    continue
+                for child in sorted(base.iterdir()):
+                    if child.is_dir():
+                        n = count_images_in_dir(child)
+                        rows.append((f"{sub} / {child.name}", n))
+            total = sum(r[1] for r in rows)
+            if not rows:
+                self.label_counts.setText("(train/val にクラスフォルダがありません)")
+            else:
+                lines = [f"{label}: {n} 枚" for label, n in rows]
+                lines.append(f"--- 合計: {total} 枚 ---")
+                self.label_counts.setText("\n".join(lines))
+        except Exception as e:
+            self.label_counts.setText(f"エラー: {e}")
+        QApplication.processEvents()
 
     def select_video_folder(self):
         path = QFileDialog.getExistingDirectory(self, "動画フォルダを選択", self._last_video_dir)

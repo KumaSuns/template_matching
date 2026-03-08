@@ -10,12 +10,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QPushButton,
     QLabel,
+    QCheckBox,
     QScrollArea,
     QFrame,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QFont
 
 # フォルダ名 → 表示名。新しいシステムを追加したらここに追加する
@@ -78,10 +80,21 @@ class LauncherWindow(QMainWindow):
         self.setWindowTitle("ツール一覧")
         self.setMinimumSize(360, 240)
         self._platform = get_platform_name()
+        self._settings = QSettings("Analyzer", "Launcher")
         self.setup_ui()
         style = get_platform_stylesheet(self._platform)
         if style:
             self.setStyleSheet(style)
+        on_top = self._settings.value("windowOnTop", False, type=bool)
+        self._set_stay_on_top(on_top)
+        self.check_on_top.setChecked(on_top)
+
+    def _set_stay_on_top(self, on: bool):
+        if on:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        else:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+        self.show()
 
     def setup_ui(self):
         central = QWidget()
@@ -100,6 +113,14 @@ class LauncherWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         title.setFont(QFont(None, 12))
         layout.addWidget(title)
+
+        on_top_row = QHBoxLayout()
+        on_top_row.addStretch()
+        self.check_on_top = QCheckBox("最前面に表示")
+        self.check_on_top.stateChanged.connect(self._on_stay_on_top_changed)
+        on_top_row.addWidget(self.check_on_top)
+        on_top_row.addStretch()
+        layout.addLayout(on_top_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -123,6 +144,11 @@ class LauncherWindow(QMainWindow):
         scroll_layout.addStretch()
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
+
+    def _on_stay_on_top_changed(self, _state):
+        on = self.check_on_top.isChecked()
+        self._settings.setValue("windowOnTop", on)
+        self._set_stay_on_top(on)
 
 
 def main():
